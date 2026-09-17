@@ -64,7 +64,7 @@ def reset_lease_tables(db_engine: Engine):
     with db_engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE idempotency_keys, leases "
+                "TRUNCATE TABLE idempotency_keys, lease_renewals, leases "
                 "RESTART IDENTITY CASCADE"
             )
         )
@@ -96,6 +96,22 @@ def acquire(
 
 def release(client: httpx.Client, lease_token: str) -> httpx.Response:
     return client.post(f"/leases/{lease_token}/release")
+
+
+def renew(
+    client: httpx.Client,
+    lease_token: str,
+    *,
+    additional_seconds: int = 10,
+    idempotency_key: str | None = None,
+) -> httpx.Response:
+    return client.post(
+        f"/leases/{lease_token}/renew",
+        json={
+            "additional_seconds": additional_seconds,
+            "idempotency_key": idempotency_key or make_key(),
+        },
+    )
 
 
 def count_rows(db_engine: Engine, sql: str, **params: Any) -> int:

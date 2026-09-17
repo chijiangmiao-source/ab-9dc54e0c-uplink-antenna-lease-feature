@@ -13,6 +13,9 @@
 - 过站期间控制程序连续下发多条指令，值班人员可凭令牌**上报已确认执行到的指令序号**
   （`POST /leases/{lease_token}/progress`）：序号只能递增，相同序号重放返回原记录时间，
   上报**不会延长租约占用期限**；
+- 过站窗口临时延长时，当前持有方可凭令牌**续期**（`POST /leases/{lease_token}/renew`）：
+  在租约仍有效期间追加 5–120 秒，从**原到期时间**累加，无需释放控制权后重新争抢；
+  续期携带幂等键，同键同参重试只延长一次，续期与到期交接在边界处只有一方成功；
 - 未知天线、越界租期返回稳定错误，且**不落任何库记录**。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16（`pgcrypto`）· Alembic · pytest。
@@ -73,8 +76,8 @@ API 容器启动时由 `entrypoint.sh` **自动执行 `alembic upgrade head`**�
 ### 一次性验收服务 verify
 
 `verify` 服务会等待 `db` 与 `api` 都健康，然后针对**真实 API + 真实 PostgreSQL**
-跑完整 pytest（并发争抢、幂等重放、参数冲突、到期交接、输入拒绝、指令进度上报），结束即退出，
-退出码即验收结论，**不会重启**：
+跑完整 pytest（并发争抢、幂等重放、参数冲突、到期交接、输入拒绝、指令进度上报、
+提前释放、租约续期），结束即退出，退出码即验收结论，**不会重启**：
 
 ```bash
 docker compose up --build verify
@@ -118,6 +121,11 @@ alembic downgrade base    # 回滚全部迁移
 - `alembic/versions/0002_lease_release.py`：在进度迁移之后增加
   `released_at TIMESTAMPTZ NULL`。该值只由数据库时钟在提前释放时写入；
   `NULL` 表示仍未主动让权。
+- `alembic/versions/0003_lease_renewals.py`：`lease_renewals` 表
+  （`id PK, lease_id FK, idempotency_key UNIQUE, request_params,
+  additional_seconds, previous_expires_at, new_expires_at, created_at`），
+  每次成功续期落一行，同时充当续期的幂等记录；`leases` 本身不加列，
+  历史租约无需补数据。
 
 ---
 
@@ -177,11 +185,11 @@ curl -sS -X POST http://localhost:8000/leases \
 | HTTP | code | 触发条件 | 是否落库 |
 | --- | --- | --- | --- |
 | 404 | `ANTENNA_NOT_FOUND` | 未知天线编号 | 否 |
-| 422 | `VALIDATION_ERROR` | 租期越界（非 5–120 整数）、缺字段、空白、多余字段 | 否 |
+| 422 | `VALIDATION_ERROR` | 租期/追加秒数越界（非 5–120 整数）、缺字段、空白、多余字段 | 否 |
 | 409 | `ANTENNA_BUSY` | 存在未到期租约（`details.expires_at` 给出交接时间） | 否 |
-| 409 | `IDEMPOTENCY_CONFLICT` | 同幂等键但参数与首次不同 | 否（首次成功请求的记录保留） |
-| 404 | `LEASE_NOT_FOUND` | `GET /leases/{token}` 或进度上报时令牌未知 | 否 |
-| 409 | `LEASE_EXPIRED` | 对已到期租约（`expires_at <= clock_timestamp()`）上报进度 | 否 |
+| 409 | `IDEMPOTENCY_CONFLICT` | 同幂等键但参数与首次不同（获取与续期各自判定） | 否（首次成功请求的记录保留） |
+| 404 | `LEASE_NOT_FOUND` | `GET /leases/{token}`、进度上报、释放或续期时令牌未知 | 否 |
+| 409 | `LEASE_EXPIRED` | 对已到期（或已提前释放）租约上报进度、释放或续期 | 否 |
 | 409 | `PROGRESS_REGRESSION` | 上报序号小于已确认序号（相同序号视为重放，不是错误） | 否 |
 
 `ANTENNA_BUSY` 示例：
@@ -277,7 +285,56 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/progress \
 curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/release
 ```
 
-### 4.5 其他接口
+### 4.5 续期 `POST /leases/{lease_token}/renew`
+
+过站窗口临时延长时，当前持有方可凭令牌在租约仍有效期间追加时长，
+无需释放控制权后重新参与争抢。追加时长从**原到期时间**累加
+（`expires_at = expires_at + 追加秒数`），不是从续期时刻起算。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `additional_seconds` | int | 追加秒数，闭区间 **[5, 120]** 秒（JSON 整数，不接受文本） |
+| `idempotency_key` | string | 调用方生成的幂等键，1–128 字符 |
+
+成功 `200`：
+
+```json
+{
+  "lease_token": "k3J9…",
+  "previous_expires_at": "2026-09-12T04:00:30.123456+00:00",
+  "expires_at": "2026-09-12T04:01:00.123456+00:00",
+  "replay": false
+}
+```
+
+- `previous_expires_at` / `expires_at` 分别是续期前后的到期时间，
+  时间格式与其他接口完全一致（显式 `+00:00`）；续期后 `GET /leases/{token}`
+  与 `ANTENNA_BUSY` 详情所示的到期时间即新边界；
+- 首次成功 `replay: false`；**同键同参重试**返回 `replay: true`，
+  除该标记外业务字段与首次结果逐字节一致，租约**只被延长一次**
+  （即使首次响应在链路中丢失）；
+- **同键改参**（换个令牌或换个秒数复用同一幂等键）返回稳定
+  `409 IDEMPOTENCY_CONFLICT`，不写库；
+- 未知令牌 `404 LEASE_NOT_FOUND`；已到期或已提前释放的租约
+  `409 LEASE_EXPIRED`（边界同样归新请求：`expires_at <= clock_timestamp()`
+  即视为已交接）；任何拒绝都不改写租约、不影响后来持有者；
+- 续期与获取走同一把天线行锁，因此续期与到期交接在边界处**只有一方成功**：
+  要么续期先提交（争抢者看到新边界得到 `ANTENNA_BUSY`），
+  要么租约已交接（续期得到 `LEASE_EXPIRED`），绝不出现双重控制权；
+- 续期可多次进行（不同幂等键），时长逐次累加；续期记录落
+  `lease_renewals` 表，租约过期后同键重试仍重放首次记录。
+
+curl：
+
+```bash
+curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/renew \
+  -H 'Content-Type: application/json' \
+  -d '{"additional_seconds": 30, "idempotency_key": "renew-pass-7f3a-1"}'
+```
+
+### 4.6 其他接口
 
 - `GET /leases/{lease_token}` — 查询租约与 `active` 状态（以数据库时间实时计算），
   含上述两个可空进度字段和可空的 `released_at`；
@@ -318,6 +375,21 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/release
 记录保持不变。获取租约的活跃谓词同时要求 `released_at IS NULL`，所以释放提交后
 下一位控制者可以立即取得天线。
 
+续期（`POST /leases/{token}/renew`）复用同一套单事务模型：
+
+1. `pg_advisory_xact_lock(hashtext(:idempotency_key))` —— 同键续期串行化，
+   丢响应重试不可能把租约延长两次；
+2. 查 `lease_renewals`：参数一致 → 重放记录的续期前后到期时间；不一致 →
+   稳定 `IDEMPOTENCY_CONFLICT`；
+3. 按令牌找到租约（未知令牌在任何写操作之前返回 `LEASE_NOT_FOUND`）；
+4. `SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE`
+   —— 与获取、进度、释放同一把天线行锁，续期与到期交接在此串行化；
+5. 锁后以数据库时间复核 `released_at IS NULL AND expires_at > clock_timestamp()`，
+   已到期或已释放 → `LEASE_EXPIRED`，不写库；
+6. `UPDATE leases SET expires_at = expires_at + make_interval(...)` 从原到期时间
+   累加，并在同事务把续期前后到期时间写入 `lease_renewals`。
+   由于交接判定与续期判定使用同一时钟、同一把锁，边界处只有一方成功。
+
 ---
 
 ## 6. 本地运行测试（不使用 verify 容器）
@@ -354,6 +426,11 @@ pytest
   20 路屏障并发上报最终保留最大序号、到期交接后旧令牌被拒新持有方可上报。
 - `tests/test_release.py` — 活跃租约提前释放后立即交接、重复释放稳定重放、
   自然到期拒绝写入，以及释放与争抢并发时不产生双重控制权。
+- `tests/test_renew.py` — 获取后续期并在**新边界**完成交接、同键重试只延长一次
+  （含 8 路并发同键）、同键改参/换令牌稳定冲突、未知/已到期/已释放令牌拒绝且
+  数据不变、多次续期从原到期时间逐次累加、6 路并发异键续期串行成链、
+  续期与到期争抢并发时无双重控制权、过期后同键仍重放、非法请求体 422 零落库、
+  获取与查询响应形状保持兼容。
 
 测试不使用任何固定响应或假接口：全部通过 HTTP 打向真实服务，并直连真实
 PostgreSQL 制造并发、播种到期数据和断言提交结果。

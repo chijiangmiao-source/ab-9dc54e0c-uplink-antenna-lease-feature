@@ -25,3 +25,9 @@ DATABASE_URL: str = _database_url()
 # Inclusive lease duration bounds in seconds.
 MIN_LEASE_SECONDS: int = 5
 MAX_LEASE_SECONDS: int = 120
+
+# Inclusive bounds for a single renewal extension, in seconds. A renewal adds
+# on top of the lease's current expiry; each individual addition stays within
+# the same window as an initial acquisition.
+MIN_RENEW_SECONDS: int = 5
+MAX_RENEW_SECONDS: int = 120

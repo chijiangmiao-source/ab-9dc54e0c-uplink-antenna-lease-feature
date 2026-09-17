@@ -19,8 +19,9 @@ Concurrency design (all inside one READ COMMITTED transaction):
    and its idempotency record, then commit atomically.
 
 Progress reporting and early release take the same antenna row lock as lease
-acquisition. Every timestamp originates from PostgreSQL; the host clock is
-never read.
+acquisition. Renewal does too, and additionally serialises same-key retries on
+an advisory lock before recording the extension in ``lease_renewals``. Every
+timestamp originates from PostgreSQL; the host clock is never read.
 """
 
 from __future__ import annotations
@@ -30,7 +31,12 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
+from app.config import (
+    MAX_LEASE_SECONDS,
+    MAX_RENEW_SECONDS,
+    MIN_LEASE_SECONDS,
+    MIN_RENEW_SECONDS,
+)
 from app.errors import APIError
 
 
@@ -40,6 +46,14 @@ def _canonical_params(antenna_id: str, controller: str, duration_seconds: int) -
         f"antenna_id={antenna_id}\n"
         f"controller={controller}\n"
         f"duration_seconds={duration_seconds}"
+    )
+
+
+def _canonical_renew_params(lease_token: str, additional_seconds: int) -> str:
+    # Same fingerprint discipline as acquisition, scoped to one lease token.
+    return (
+        f"lease_token={lease_token}\n"
+        f"additional_seconds={additional_seconds}"
     )
 
 
@@ -408,3 +422,184 @@ def _release_result(row: Any, released_at: Any) -> dict[str, Any]:
     result["released_at"] = released_at
     result["active"] = False
     return result
+
+
+def renew_lease(
+    conn: Connection,
+    token: str,
+    *,
+    additional_seconds: int,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Extend an active lease by ``additional_seconds`` from its current expiry.
+
+    All work happens in one READ COMMITTED transaction, mirroring the
+    acquisition flow:
+
+    1. ``pg_advisory_xact_lock(hashtext(:key))`` serialises retries that share
+       the renewal idempotency key, so a lost response can never extend the
+       lease twice.
+    2. Look up the stored renewal record. Same parameters -> replay the
+       recorded before/after expiry byte-stably; different parameters (other
+       token or other seconds) -> stable ``IDEMPOTENCY_CONFLICT``. Neither
+       path writes.
+    3. The token must identify an existing lease; unknown tokens raise
+       ``LEASE_NOT_FOUND`` before any lock or write.
+    4. ``SELECT ... FROM antennas WHERE id = :antenna_id FOR UPDATE`` — the
+       same antenna row lock acquisition takes. Renewal and expiry hand-over
+       are therefore serialised: exactly one of them wins at the boundary.
+    5. Re-read the lease AFTER the lock and confirm
+       ``released_at IS NULL AND expires_at > clock_timestamp()`` (database
+       clock only). An expired or released lease raises ``LEASE_EXPIRED`` and
+       is left untouched.
+    6. Extend from the ORIGINAL expiry — ``expires_at = expires_at +
+       make_interval(...)``, never from "now" — and record the renewal
+       (before/after expiry copied from the same UPDATE) atomically.
+    """
+    # Defence in depth alongside the Pydantic boundary check.
+    if not (
+        isinstance(additional_seconds, int)
+        and not isinstance(additional_seconds, bool)
+        and MIN_RENEW_SECONDS <= additional_seconds <= MAX_RENEW_SECONDS
+    ):
+        raise APIError(
+            422,
+            "VALIDATION_ERROR",
+            f"追加秒数必须为 {MIN_RENEW_SECONDS} 至 {MAX_RENEW_SECONDS} 秒之间的整数。",
+            {
+                "additional_seconds": additional_seconds,
+                "min": MIN_RENEW_SECONDS,
+                "max": MAX_RENEW_SECONDS,
+            },
+        )
+
+    fingerprint = _canonical_renew_params(token, additional_seconds)
+
+    # 1. Serialise transactions sharing one renewal idempotency key.
+    conn.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": idempotency_key},
+    )
+
+    # 2. Replay or stable conflict. The recorded before/after expiry comes
+    #    back byte-identically; only the replay flag differs.
+    existing = conn.execute(
+        text(
+            """
+            SELECT r.lease_id, r.request_params,
+                   r.previous_expires_at, r.new_expires_at,
+                   l.token AS lease_token
+            FROM lease_renewals r
+            JOIN leases l ON l.id = r.lease_id
+            WHERE r.idempotency_key = :key
+            """
+        ),
+        {"key": idempotency_key},
+    ).mappings().first()
+
+    if existing is not None:
+        if existing.request_params != fingerprint:
+            raise APIError(
+                409,
+                "IDEMPOTENCY_CONFLICT",
+                "同一幂等键曾用于不同的续期参数，拒绝执行。",
+                {
+                    "idempotency_key": idempotency_key,
+                    "original_params": existing.request_params,
+                    "request_params": fingerprint,
+                },
+            )
+        return {
+            "lease_token": existing.lease_token,
+            "previous_expires_at": existing.previous_expires_at,
+            "expires_at": existing.new_expires_at,
+            "replay": True,
+        }
+
+    # 3. Resolve the lease (no writes before this point for unknown tokens).
+    found = conn.execute(
+        text("SELECT id, antenna_id FROM leases WHERE token = :token"),
+        {"token": token},
+    ).mappings().first()
+    if found is None:
+        raise APIError(
+            404,
+            "LEASE_NOT_FOUND",
+            "未知租约令牌。",
+            {"lease_token": token},
+        )
+
+    # 4. Lock the antenna row: the same lock acquisition, progress and
+    #    release take, so a renewal can never overlap an expiry hand-over.
+    conn.execute(
+        text("SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE"),
+        {"antenna_id": found.antenna_id},
+    )
+
+    # 5. Re-read after the lock and confirm the lease is still held, judged
+    #    purely by the database clock. The boundary belongs to the incoming
+    #    acquirer: expires_at <= clock_timestamp() is already handed over.
+    lease = conn.execute(
+        text(
+            """
+            SELECT id AS lease_id, antenna_id, expires_at, released_at,
+                   (released_at IS NULL AND expires_at > clock_timestamp())
+                       AS still_held
+            FROM leases
+            WHERE id = :lease_id
+            """
+        ),
+        {"lease_id": found.id},
+    ).mappings().one()
+
+    if not lease.still_held:
+        raise APIError(
+            409,
+            "LEASE_EXPIRED",
+            "租约已到期或已提前释放，不能续期。",
+            {
+                "lease_token": token,
+                "antenna_id": lease.antenna_id,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        )
+
+    # 6. Extend from the lease's own current expiry and record the renewal in
+    #    the same statement pair of one transaction. ``previous_expires_at``
+    #    is recovered from the UPDATE itself, so the record can never disagree
+    #    with the lease row.
+    row = conn.execute(
+        text(
+            """
+            WITH updated AS (
+                UPDATE leases
+                SET expires_at = expires_at + make_interval(secs => :additional)
+                WHERE id = :lease_id
+                RETURNING id AS lease_id,
+                          expires_at - make_interval(secs => :additional)
+                              AS previous_expires_at,
+                          expires_at AS new_expires_at
+            ), recorded AS (
+                INSERT INTO lease_renewals
+                    (lease_id, idempotency_key, request_params,
+                     additional_seconds, previous_expires_at, new_expires_at)
+                SELECT lease_id, :key, :params, :additional,
+                       previous_expires_at, new_expires_at
+                FROM updated
+            )
+            SELECT previous_expires_at, new_expires_at FROM updated
+            """
+        ),
+        {
+            "lease_id": lease.lease_id,
+            "additional": additional_seconds,
+            "key": idempotency_key,
+            "params": fingerprint,
+        },
+    ).mappings().one()
+    return {
+        "lease_token": token,
+        "previous_expires_at": row.previous_expires_at,
+        "expires_at": row.new_expires_at,
+        "replay": False,
+    }

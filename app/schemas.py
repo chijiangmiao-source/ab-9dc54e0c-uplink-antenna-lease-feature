@@ -13,7 +13,12 @@ from pydantic import (
     field_validator,
 )
 
-from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
+from app.config import (
+    MAX_LEASE_SECONDS,
+    MAX_RENEW_SECONDS,
+    MIN_LEASE_SECONDS,
+    MIN_RENEW_SECONDS,
+)
 
 
 class AcquireRequest(BaseModel):
@@ -103,4 +108,41 @@ class ProgressResponse(BaseModel):
 
     @field_serializer("last_progress_at", when_used="always")
     def _serialize_progress_at(self, value: datetime) -> str:
+        return value.isoformat()
+
+
+class RenewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    additional_seconds: StrictInt = Field(
+        ...,
+        ge=MIN_RENEW_SECONDS,
+        le=MAX_RENEW_SECONDS,
+        description=f"追加的租约秒数（必须是 JSON 整数，不接受文本数字），闭区间 [{MIN_RENEW_SECONDS}, {MAX_RENEW_SECONDS}] 秒。",
+    )
+    idempotency_key: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("不能为空或纯空白。")
+        return value
+
+
+class RenewResponse(BaseModel):
+    """Result of a lease renewal.
+
+    ``previous_expires_at`` is the expiry the lease had before this renewal;
+    ``expires_at`` is the new (current) expiry. A same-key replay returns the
+    recorded pair byte-identically, only ``replay`` flips to true.
+    """
+
+    lease_token: str
+    previous_expires_at: datetime
+    expires_at: datetime
+    replay: bool = False
+
+    @field_serializer("previous_expires_at", "expires_at", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
         return value.isoformat()

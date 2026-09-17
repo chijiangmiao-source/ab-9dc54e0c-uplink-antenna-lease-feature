@@ -21,6 +21,7 @@ def test_app_module_imports_and_routes_are_registered():
     assert "/leases" in paths
     assert "/leases/{lease_token}" in paths
     assert "/leases/{lease_token}/release" in paths
+    assert "/leases/{lease_token}/renew" in paths
     assert "/health" in paths
 
 
