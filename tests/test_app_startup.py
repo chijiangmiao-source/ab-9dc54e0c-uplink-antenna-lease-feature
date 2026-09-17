@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.main import app
-from app.schemas import AcquireResponse, LeaseStatusResponse
+from app.schemas import AcquireResponse, LeaseStatusResponse, RenewResponse
 
 
 def test_app_module_imports_and_routes_are_registered():
@@ -21,6 +21,7 @@ def test_app_module_imports_and_routes_are_registered():
     assert "/leases" in paths
     assert "/leases/{lease_token}" in paths
     assert "/leases/{lease_token}/release" in paths
+    assert "/leases/{lease_token}/renew" in paths
     assert "/health" in paths
 
 
@@ -45,3 +46,17 @@ def test_both_response_models_serialise_timestamps_identically():
     # Explicit offset, never the bare "Z" shorthand.
     assert not acquired["expires_at"].endswith("Z")
     assert not status["expires_at"].endswith("Z")
+
+
+def test_renew_response_serialises_timestamps_with_explicit_offset():
+    instant = datetime(2026, 9, 12, 4, 0, 30, 123456, tzinfo=timezone.utc)
+    body = RenewResponse(
+        lease_token="x" * 43,
+        expires_before=instant,
+        expires_after=instant,
+        replay=False,
+    ).model_dump(mode="json")
+    expected = "2026-09-12T04:00:30.123456+00:00"
+    assert body["expires_before"] == expected
+    assert body["expires_after"] == expected
+    assert not body["expires_after"].endswith("Z")

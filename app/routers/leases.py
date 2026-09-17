@@ -13,11 +13,14 @@ from app.schemas import (
     LeaseStatusResponse,
     ProgressRequest,
     ProgressResponse,
+    RenewRequest,
+    RenewResponse,
 )
 from app.services import (
     acquire_lease,
     get_lease_by_token,
     release_lease,
+    renew_lease,
     report_progress,
 )
 
@@ -115,3 +118,28 @@ def release(lease_token: str, session: Session = Depends(get_session)):
         raise
     session.commit()
     return _to_status_response(result)
+
+
+@router.post(
+    "/leases/{lease_token}/renew",
+    response_model=RenewResponse,
+    status_code=200,
+    summary="租约仍有效时凭令牌追加租期（5–120 秒，幂等）",
+)
+def renew(
+    lease_token: str,
+    payload: RenewRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        result = renew_lease(
+            session.connection(),
+            token=lease_token,
+            additional_seconds=payload.additional_seconds,
+            idempotency_key=payload.idempotency_key,
+        )
+    except APIError:
+        session.rollback()
+        raise
+    session.commit()
+    return result

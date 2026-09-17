@@ -86,6 +86,39 @@ class LeaseStatusResponse(_LeaseBase):
         return value.isoformat() if value is not None else None
 
 
+class RenewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    # Seconds appended to the lease's current expiry. JSON integer only
+    # (a textual "30" is rejected); same inclusive [5, 120] bounds as the
+    # initial lease duration.
+    additional_seconds: StrictInt = Field(
+        ...,
+        ge=MIN_LEASE_SECONDS,
+        le=MAX_LEASE_SECONDS,
+        description=f"追加租期（必须是 JSON 整数，不接受文本数字），闭区间 [{MIN_LEASE_SECONDS}, {MAX_LEASE_SECONDS}] 秒。",
+    )
+    idempotency_key: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("不能为空或纯空白。")
+        return value
+
+
+class RenewResponse(BaseModel):
+    lease_token: str
+    expires_before: datetime
+    expires_after: datetime
+    replay: bool = False
+
+    @field_serializer("expires_before", "expires_after", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
+        return value.isoformat()
+
+
 class ProgressRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 

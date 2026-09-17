@@ -64,7 +64,7 @@ def reset_lease_tables(db_engine: Engine):
     with db_engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE idempotency_keys, leases "
+                "TRUNCATE TABLE idempotency_keys, lease_renewals, leases "
                 "RESTART IDENTITY CASCADE"
             )
         )
